@@ -233,8 +233,14 @@ impl FromStr for UIntType {
 /// Identity is the declared name: enums may only be declared at the top
 /// level of the program's own files, so the name is unique program-wide and
 /// serialized forms (such as the ABI) can identify an enum by it.
+///
+/// The definition sits behind a single pointer, because it is the largest
+/// part of [`TypeInner`], and so sets the size of every type and of errors that hold types.
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct EnumInfo {
+pub struct EnumInfo(Arc<EnumDefinition>);
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct EnumDefinition {
     name: Arc<str>,
     variants: Arc<[EnumVariantInfo]>,
 }
@@ -247,17 +253,17 @@ impl EnumInfo {
     /// A single-variant enum is a named wrapper of its payload.
     pub(crate) fn new(name: Arc<str>, variants: Arc<[EnumVariantInfo]>) -> Self {
         debug_assert!(!variants.is_empty());
-        Self { name, variants }
+        Self(Arc::new(EnumDefinition { name, variants }))
     }
 
     /// Access the declared name of the enum.
     pub fn name(&self) -> &str {
-        &self.name
+        &self.0.name
     }
 
     /// Access the variants of the enum in declaration order.
     pub fn variants(&self) -> &[EnumVariantInfo] {
-        &self.variants
+        &self.0.variants
     }
 
     /// Get the variant with the given `name` and its position among the
@@ -265,7 +271,7 @@ impl EnumInfo {
     ///
     /// The position determines the variant's leaf in the balanced sum.
     pub fn variant(&self, name: &Identifier) -> Option<(usize, &EnumVariantInfo)> {
-        self.variants
+        self.variants()
             .iter()
             .enumerate()
             .find(|(_, v)| v.name() == name)
@@ -274,10 +280,36 @@ impl EnumInfo {
     /// The structural payload types of all variants, in declaration order:
     /// the leaves of the enum's balanced sum.
     pub(crate) fn structural_variants(&self) -> Vec<StructuralType> {
-        self.variants
+        self.variants()
             .iter()
             .map(EnumVariantInfo::structural_payload)
             .collect()
+    }
+
+    /// Move the payload types into `parts` if nothing else refers to them,
+    /// and leave leaves in their place.
+    ///
+    /// The `Drop` implementation of [`ResolvedType`] uses this, so that dropping
+    /// a chain of enums whose payloads are enums does not recurse.
+    pub(super) fn take_unique_payloads(&mut self, parts: &mut Vec<ResolvedType>) {
+        let Some(definition) = Arc::get_mut(&mut self.0) else {
+            return;
+        };
+        let Some(variants) = Arc::get_mut(&mut definition.variants) else {
+            return;
+        };
+
+        for variant in variants.iter_mut() {
+            parts.push(std::mem::replace(
+                &mut variant.payload_ty,
+                ResolvedType::boolean(),
+            ));
+            if let Some(payload) = Arc::get_mut(&mut variant.payload) {
+                for ty in payload.iter_mut() {
+                    parts.push(std::mem::replace(ty, ResolvedType::boolean()));
+                }
+            }
+        }
     }
 }
 

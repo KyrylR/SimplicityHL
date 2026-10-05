@@ -175,6 +175,58 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_shared_types_are_not_walked_as_trees() {
+        let pair = ResolvedType::array(shared_type(ResolvedType::u8(), 64), 2);
+        let triple = ResolvedType::array(shared_type(ResolvedType::u8(), 64), 3);
+        assert!(!pair.compatible(&triple));
+    }
+
+    #[test]
+    fn shared_types_are_lowered_once_per_part() {
+        let small = shared_type(ResolvedType::u8(), 2);
+        let array = ResolvedType::array(ResolvedType::u8(), 4);
+        assert_eq!(StructuralType::from(&small), StructuralType::from(&array));
+
+        // Deep enough to hang if lowered as a tree, but small enough for its bit width.
+        let healthy = shared_type(ResolvedType::u8(), 40);
+        let separate = shared_type(ResolvedType::u8(), 40);
+        assert_eq!(
+            StructuralType::from(&healthy),
+            StructuralType::from(&separate)
+        );
+    }
+
+    #[test]
+    fn types_in_messages_are_cut_off() {
+        let pair = ResolvedType::tuple([ResolvedType::u8(), ResolvedType::never()]);
+        assert_eq!("(u8, _)", pair.in_message().to_string());
+
+        let shared = shared_type(ResolvedType::u8(), 64);
+        let message = shared.in_message().to_string();
+        assert!(message.contains("...") && message.len() < 10_000);
+        assert_eq!(message.matches('(').count(), message.matches(')').count());
+    }
+
+    #[test]
+    fn deep_types_are_dropped_without_recursion() {
+        // Deep enough to overflow the stack of a test thread if dropped recursively.
+        let depth = 100_000;
+        let mut option = ResolvedType::u8();
+        let mut tuple = ResolvedType::u8();
+        let mut enumeration = ResolvedType::u8();
+        for i in 0..depth {
+            option = ResolvedType::option(option);
+            tuple = ResolvedType::tuple([tuple, ResolvedType::u8()]);
+            let payload = Arc::from([enumeration]);
+            let variant = EnumVariantInfo::new(Identifier::from_str_unchecked("V"), payload);
+            let info = EnumInfo::new(Arc::from(format!("E{i}")), Arc::from([variant]));
+            enumeration = ResolvedType::enumeration(info);
+        }
+
+        drop((option, tuple, enumeration));
+    }
+
+    #[test]
     #[should_panic(expected = "the never type has no structural type")]
     fn never_type_has_no_structural_type() {
         let _ = StructuralType::from(&ResolvedType::option(ResolvedType::never()));

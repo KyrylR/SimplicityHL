@@ -1,5 +1,5 @@
 use core::fmt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use miniscript::iter::{Tree, TreeLike};
@@ -10,13 +10,86 @@ use super::{
 use crate::num::NonZeroPow2Usize;
 
 /// SimplicityHL type without type aliases.
+///
+/// Types built from aliases share their parts, so walking them as trees can take time
+/// exponential in the number of aliases. Walks over types visit each shared part once.
 #[derive(PartialEq, Eq, Hash, Clone)]
-pub struct ResolvedType(TypeInner<Arc<Self>>);
+pub struct ResolvedType {
+    inner: TypeInner<Arc<Self>>,
+    /// Whether the type mentions `!` outside enum payloads.
+    has_never: bool,
+    /// Whether the type mentions an enum.
+    has_enum: bool,
+}
 
 impl ResolvedType {
+    /// Create a type from its outermost constructor,
+    /// recording what its parts mention so that checking it takes constant time.
+    fn new(inner: TypeInner<Arc<Self>>) -> Self {
+        let (has_never, has_enum) = match &inner {
+            TypeInner::Never => (true, false),
+            TypeInner::Enum(_) => (false, true),
+            TypeInner::Boolean | TypeInner::UInt(_) => (false, false),
+            TypeInner::Option(part) | TypeInner::Array(part, _) | TypeInner::List(part, _) => {
+                Self::mentions([part])
+            }
+            TypeInner::Either(left, right) => Self::mentions([left, right]),
+            TypeInner::Tuple(elements) => Self::mentions(elements.iter()),
+        };
+
+        Self {
+            inner,
+            has_never,
+            has_enum,
+        }
+    }
+
+    /// Whether any part mentions `!` outside enum payloads, and whether any mentions an enum.
+    fn mentions<'a>(parts: impl IntoIterator<Item = &'a Arc<Self>>) -> (bool, bool) {
+        parts
+            .into_iter()
+            .fold((false, false), |(never, enumeration), part| {
+                (never || part.has_never, enumeration || part.has_enum)
+            })
+    }
+
     /// Access the inner type primitive.
     pub fn as_inner(&self) -> &TypeInner<Arc<Self>> {
-        &self.0
+        &self.inner
+    }
+
+    /// Call `visit` on each part of the type one level down, including the payloads of an enum.
+    fn for_each_part<'a>(&'a self, mut visit: impl FnMut(&'a Self)) {
+        match self.as_inner() {
+            TypeInner::Either(left, right) => {
+                visit(left);
+                visit(right);
+            }
+            TypeInner::Option(part) | TypeInner::Array(part, _) | TypeInner::List(part, _) => {
+                visit(part);
+            }
+            TypeInner::Tuple(elements) => {
+                for element in elements.iter() {
+                    visit(element);
+                }
+            }
+            TypeInner::Enum(info) => {
+                for variant in info.variants() {
+                    visit(variant.payload_type());
+                }
+            }
+            TypeInner::Boolean | TypeInner::UInt(_) | TypeInner::Never => {}
+        }
+    }
+
+    /// The number of parts of the type one level down, as written in its name.
+    fn n_parts(&self) -> usize {
+        match self.as_inner() {
+            TypeInner::Either(..) => 2,
+            TypeInner::Option(_) | TypeInner::Array(..) | TypeInner::List(..) => 1,
+            TypeInner::Tuple(elements) => elements.len(),
+            TypeInner::Boolean | TypeInner::UInt(_) | TypeInner::Enum(_) | TypeInner::Never => 0,
+        }
     }
 }
 
@@ -33,12 +106,16 @@ impl ResolvedType {
 impl ResolvedType {
     /// Create a nominal enum type from the given definition.
     pub const fn enumeration(info: EnumInfo) -> Self {
-        Self(TypeInner::Enum(info))
+        Self {
+            inner: TypeInner::Enum(info),
+            has_never: false,
+            has_enum: true,
+        }
     }
 
     /// Access the enum definition if this is an enum type.
     pub const fn as_enum(&self) -> Option<&EnumInfo> {
-        match &self.0 {
+        match &self.inner {
             TypeInner::Enum(info) => Some(info),
             _ => None,
         }
@@ -46,8 +123,7 @@ impl ResolvedType {
 
     /// Check whether the type mentions an enum, at any nesting depth.
     pub fn contains_enum(&self) -> bool {
-        self.post_order_iter()
-            .any(|data| data.node.as_enum().is_some())
+        self.has_enum
     }
 }
 
@@ -55,119 +131,176 @@ impl ResolvedType {
 impl ResolvedType {
     /// Create the uninhabited type.
     pub const fn never() -> Self {
-        Self(TypeInner::Never)
+        Self {
+            inner: TypeInner::Never,
+            has_never: true,
+            has_enum: false,
+        }
     }
 
     /// Check whether this is the uninhabited type.
     pub const fn is_never(&self) -> bool {
-        matches!(self.0, TypeInner::Never)
+        matches!(self.inner, TypeInner::Never)
     }
 
     /// Check whether the type mentions the uninhabited type, at any nesting depth
     /// except inside enum payloads, because messages show an enum by its name.
     pub(crate) fn contains_never(&self) -> bool {
-        self.reaches_never(false)
+        self.has_never
     }
 
     /// Check whether the type can be lowered to a structural type.
     ///
     /// Unlike [`Self::contains_never`], this looks inside enum payloads.
     pub(crate) fn has_structural_type(&self) -> bool {
-        !self.reaches_never(true)
-    }
-
-    /// Search the type for `!`, visiting each shared part once.
-    ///
-    /// Types built from aliases share their parts, so walking them as trees
-    /// can take time exponential in the number of aliases.
-    fn reaches_never(&self, inside_enums: bool) -> bool {
+        // Only enums can hide `!`, so only parts with enums are searched, each once.
         let mut visited = HashSet::new();
         let mut stack = vec![self];
 
         while let Some(ty) = stack.pop() {
-            if !visited.insert(std::ptr::from_ref(ty)) {
-                continue;
+            if ty.has_never {
+                return false;
             }
-
-            match ty.as_inner() {
-                TypeInner::Never => return true,
-                TypeInner::Boolean | TypeInner::UInt(_) => {}
-                TypeInner::Enum(info) if inside_enums => {
-                    stack.extend(info.variants().iter().map(|v| v.payload_type()));
-                }
-                TypeInner::Enum(_) => {}
-                TypeInner::Option(inner)
-                | TypeInner::Array(inner, _)
-                | TypeInner::List(inner, _) => {
-                    stack.push(inner);
-                }
-                TypeInner::Either(left, right) => stack.extend([left.as_ref(), right.as_ref()]),
-                TypeInner::Tuple(elements) => stack.extend(elements.iter().map(Arc::as_ref)),
+            if ty.has_enum && visited.insert(std::ptr::from_ref(ty)) {
+                ty.for_each_part(|part| stack.push(part));
             }
         }
 
-        false
+        true
     }
 
-    /// Check whether the types are equal, where `!` at any depth is equal to every type.
+    /// Check whether the types are equal, where `!` is equal to every type.
     ///
     /// During analysis, `!` stands for a broken type whose error was already reported,
     /// so use this instead of `==` wherever a mismatch would be reported as an error.
+    /// Enums are compared by identity, so `!` inside an enum payload is not looked at.
     pub(crate) fn compatible(&self, other: &Self) -> bool {
-        self.compatible_pairs(other, &mut HashSet::new())
-    }
+        // Each pair of parts is compared once, without recursion, so that shared and deep
+        // types stay cheap. A pair that is met again is skipped: it is still waiting to be
+        // compared, or it was compatible, because the first mismatch ends the search.
+        let mut seen = HashSet::new();
+        let mut stack = vec![(self, other)];
 
-    fn compatible_pairs(
-        &self,
-        other: &Self,
-        seen: &mut HashSet<(*const Self, *const Self)>,
-    ) -> bool {
-        if std::ptr::eq(self, other)
-            || !seen.insert((std::ptr::from_ref(self), std::ptr::from_ref(other)))
-        {
-            return true;
-        }
-        let mut parts = |a: &Arc<Self>, b: &Arc<Self>| a.compatible_pairs(b, seen);
-
-        match (self.as_inner(), other.as_inner()) {
-            (TypeInner::Never, _) | (_, TypeInner::Never) => true,
-            (TypeInner::Either(a, b), TypeInner::Either(c, d)) => parts(a, c) && parts(b, d),
-            (TypeInner::Option(a), TypeInner::Option(b)) => parts(a, b),
-            (TypeInner::Tuple(a), TypeInner::Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| parts(x, y))
+        while let Some((a, b)) = stack.pop() {
+            let pair = (std::ptr::from_ref(a), std::ptr::from_ref(b));
+            if std::ptr::eq(a, b) || !seen.insert(pair) {
+                continue;
             }
-            (TypeInner::Array(a, m), TypeInner::Array(b, n)) => m == n && parts(a, b),
-            (TypeInner::List(a, m), TypeInner::List(b, n)) => m == n && parts(a, b),
-            _ => self == other,
+
+            match (a.as_inner(), b.as_inner()) {
+                (TypeInner::Never, _) | (_, TypeInner::Never) => {}
+                (TypeInner::Either(a1, a2), TypeInner::Either(b1, b2)) => {
+                    stack.push((a1.as_ref(), b1.as_ref()));
+                    stack.push((a2.as_ref(), b2.as_ref()));
+                }
+                (TypeInner::Option(a1), TypeInner::Option(b1)) => {
+                    stack.push((a1.as_ref(), b1.as_ref()));
+                }
+                // Copies of the same alias share their elements.
+                (TypeInner::Tuple(a1), TypeInner::Tuple(b1)) if Arc::ptr_eq(a1, b1) => {}
+                (TypeInner::Tuple(a1), TypeInner::Tuple(b1)) if a1.len() == b1.len() => {
+                    for (x, y) in a1.iter().zip(b1.iter()) {
+                        stack.push((x.as_ref(), y.as_ref()));
+                    }
+                }
+                (TypeInner::Array(a1, m), TypeInner::Array(b1, n)) if m == n => {
+                    stack.push((a1.as_ref(), b1.as_ref()));
+                }
+                (TypeInner::List(a1, m), TypeInner::List(b1, n)) if m == n => {
+                    stack.push((a1.as_ref(), b1.as_ref()));
+                }
+                (TypeInner::Boolean, TypeInner::Boolean) => {}
+                (TypeInner::UInt(m), TypeInner::UInt(n)) if m == n => {}
+                (TypeInner::Enum(m), TypeInner::Enum(n)) if m == n => {}
+                _ => return false,
+            }
         }
+
+        true
+    }
+}
+
+/// The number of parts after which a type in a message is cut off.
+///
+/// Types that share their parts, like `type A1 = (A0, A0); type A2 = (A1, A1);`,
+/// can be exponentially longer written out than declared.
+const MESSAGE_PARTS: usize = 1000;
+
+/// Types in messages.
+impl ResolvedType {
+    /// Display the type for a message, cut off after [`MESSAGE_PARTS`] parts.
+    ///
+    /// `!` is shown as `_`, because users cannot write it:
+    /// it stands for a type whose error was reported already.
+    pub(crate) fn in_message(&self) -> impl fmt::Display + '_ {
+        InMessage(self)
+    }
+}
+
+struct InMessage<'a>(&'a ResolvedType);
+
+impl fmt::Display for InMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut n_written = 0;
+        // Types whose closing text is not written yet.
+        let mut open: Vec<&ResolvedType> = Vec::new();
+
+        for data in self.0.verbose_pre_order_iter() {
+            let ty = data.node;
+            if data.n_children_yielded == 0 {
+                n_written += 1;
+                if MESSAGE_PARTS < n_written {
+                    f.write_str("...")?;
+                    // Close what is open, so that the message still reads like a type.
+                    for open_ty in open.iter().rev() {
+                        open_ty.inner.display(f, open_ty.n_parts())?;
+                    }
+                    return Ok(());
+                }
+                if ty.is_never() {
+                    f.write_str("_")?;
+                    continue;
+                }
+            }
+
+            ty.inner.display(f, data.n_children_yielded)?;
+            let n_parts = ty.n_parts();
+            if 0 < n_parts && data.n_children_yielded == 0 {
+                open.push(ty);
+            } else if 0 < n_parts && data.n_children_yielded == n_parts {
+                open.pop();
+            }
+        }
+
+        Ok(())
     }
 }
 
 impl TypeConstructible for ResolvedType {
     fn either(left: Self, right: Self) -> Self {
-        Self(TypeInner::Either(Arc::new(left), Arc::new(right)))
+        Self::new(TypeInner::Either(Arc::new(left), Arc::new(right)))
     }
 
     fn option(inner: Self) -> Self {
-        Self(TypeInner::Option(Arc::new(inner)))
+        Self::new(TypeInner::Option(Arc::new(inner)))
     }
 
     fn boolean() -> Self {
-        Self(TypeInner::Boolean)
+        Self::new(TypeInner::Boolean)
     }
 
     fn tuple<I: IntoIterator<Item = Self>>(elements: I) -> Self {
-        Self(TypeInner::Tuple(
+        Self::new(TypeInner::Tuple(
             elements.into_iter().map(Arc::new).collect(),
         ))
     }
 
     fn array(element: Self, size: usize) -> Self {
-        Self(TypeInner::Array(Arc::new(element), size))
+        Self::new(TypeInner::Array(Arc::new(element), size))
     }
 
     fn list(element: Self, bound: NonZeroPow2Usize) -> Self {
-        Self(TypeInner::List(Arc::new(element), bound))
+        Self::new(TypeInner::List(Arc::new(element), bound))
     }
 }
 
@@ -221,7 +354,7 @@ impl TypeDeconstructible for ResolvedType {
 
 impl TreeLike for &ResolvedType {
     fn as_node(&self) -> Tree<Self> {
-        match &self.0 {
+        match &self.inner {
             TypeInner::Boolean | TypeInner::UInt(..) | TypeInner::Enum(..) | TypeInner::Never => {
                 Tree::Nullary
             }
@@ -234,14 +367,15 @@ impl TreeLike for &ResolvedType {
 
 impl fmt::Debug for ResolvedType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        // Diagnostics are told apart by their debug output, so it is cut off like messages.
+        write!(f, "{}", self.in_message())
     }
 }
 
 impl fmt::Display for ResolvedType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for data in self.verbose_pre_order_iter() {
-            data.node.0.display(f, data.n_children_yielded)?;
+            data.node.inner.display(f, data.n_children_yielded)?;
         }
         Ok(())
     }
@@ -249,7 +383,44 @@ impl fmt::Display for ResolvedType {
 
 impl From<UIntType> for ResolvedType {
     fn from(value: UIntType) -> Self {
-        Self(TypeInner::UInt(value))
+        Self::new(TypeInner::UInt(value))
+    }
+}
+
+/// A type built from a chain of aliases is as deep as the chain,
+/// so dropping it recursively could overflow the stack.
+/// Instead, the parts that nothing else refers to are moved out and dropped one by one.
+impl Drop for ResolvedType {
+    fn drop(&mut self) {
+        let mut parts = Vec::new();
+        self.take_unique_parts(&mut parts);
+        while let Some(mut part) = parts.pop() {
+            part.take_unique_parts(&mut parts);
+        }
+    }
+}
+
+impl ResolvedType {
+    /// Move the parts one level down that nothing else refers to into `parts`,
+    /// and leave a leaf in their place.
+    fn take_unique_parts(&mut self, parts: &mut Vec<Self>) {
+        match std::mem::replace(&mut self.inner, TypeInner::Boolean) {
+            TypeInner::Either(left, right) => {
+                parts.extend(Arc::into_inner(left));
+                parts.extend(Arc::into_inner(right));
+            }
+            TypeInner::Option(part) | TypeInner::Array(part, _) | TypeInner::List(part, _) => {
+                parts.extend(Arc::into_inner(part));
+            }
+            // The elements can be moved out only if nothing else refers to their slice.
+            TypeInner::Tuple(slice) if Arc::strong_count(&slice) == 1 => {
+                let elements = slice.to_vec();
+                drop(slice);
+                parts.extend(elements.into_iter().filter_map(Arc::into_inner));
+            }
+            TypeInner::Enum(mut info) => info.take_unique_payloads(parts),
+            TypeInner::Tuple(_) | TypeInner::Boolean | TypeInner::UInt(_) | TypeInner::Never => {}
+        }
     }
 }
 
@@ -308,46 +479,48 @@ impl crate::ArbitraryRec for ResolvedType {
 /// Panics if the type mentions [`TypeInner::Never`].
 impl From<&ResolvedType> for StructuralType {
     fn from(value: &ResolvedType) -> Self {
-        let mut output = vec![];
-        for data in value.post_order_iter() {
-            match &data.node.0 {
-                TypeInner::Either(_, _) => {
-                    let right = output.pop().unwrap();
-                    let left = output.pop().unwrap();
-                    output.push(StructuralType::either(left, right));
+        // Each shared part is lowered once, enum payloads included. A part is popped twice:
+        // first to push its parts, then to lower it from them, which are lowered by then.
+        let mut done: HashMap<*const ResolvedType, Self> = HashMap::new();
+        let mut stack = vec![(value, false)];
+
+        while let Some((ty, parts_done)) = stack.pop() {
+            let key = std::ptr::from_ref(ty);
+            if done.contains_key(&key) {
+                continue;
+            }
+            if !parts_done {
+                stack.push((ty, true));
+                ty.for_each_part(|part| stack.push((part, false)));
+                continue;
+            }
+
+            let lowered = |part: &ResolvedType| done[&std::ptr::from_ref(part)].clone();
+            let structural = match ty.as_inner() {
+                TypeInner::Either(left, right) => Self::either(lowered(left), lowered(right)),
+                TypeInner::Option(inner) => Self::option(lowered(inner)),
+                TypeInner::Boolean => Self::boolean(),
+                TypeInner::UInt(integer) => Self::from(*integer),
+                TypeInner::Tuple(elements) => {
+                    Self::tuple(elements.iter().map(Arc::as_ref).map(lowered))
                 }
-                TypeInner::Option(_) => {
-                    let inner = output.pop().unwrap();
-                    output.push(StructuralType::option(inner));
-                }
-                TypeInner::Boolean => output.push(StructuralType::boolean()),
-                TypeInner::UInt(integer) => output.push(StructuralType::from(*integer)),
-                TypeInner::Tuple(_) => {
-                    let size = data.node.n_children();
-                    let elements = output.split_off(output.len() - size);
-                    debug_assert_eq!(elements.len(), size);
-                    output.push(StructuralType::tuple(elements));
-                }
-                TypeInner::Array(_, size) => {
-                    let element = output.pop().unwrap();
-                    output.push(StructuralType::array(element, *size));
-                }
-                TypeInner::List(_, bound) => {
-                    let element = output.pop().unwrap();
-                    output.push(StructuralType::list(element, *bound));
-                }
+                TypeInner::Array(element, size) => Self::array(lowered(element), *size),
+                TypeInner::List(element, bound) => Self::list(lowered(element), *bound),
                 TypeInner::Enum(info) => {
-                    output.push(StructuralType::balanced_sum(info.structural_variants()));
+                    let payloads = info.variants().iter().map(|v| v.payload_type());
+                    Self::balanced_sum(payloads.map(lowered).collect())
                 }
                 TypeInner::Never => {
                     panic!(
                         "the never type has no structural type; check `is_never` before lowering"
                     )
                 }
-            }
+            };
+            done.insert(key, structural);
         }
-        debug_assert_eq!(output.len(), 1);
-        output.pop().unwrap()
+
+        let key = std::ptr::from_ref(value);
+        done.remove(&key).expect("the type was lowered last")
     }
 }
 

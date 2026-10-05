@@ -883,6 +883,37 @@ impl Scope {
         }
     }
 
+    /// Record an error that holds whatever the broken types in it stand for,
+    /// such as a wrong number of elements.
+    ///
+    /// Unlike [`Self::report`], this records the error even if it mentions `!`.
+    fn report_definite(&mut self, diagnostic: Diagnostic) {
+        self.diagnostics.push(diagnostic);
+    }
+
+    /// Analyze a step of a block, such as a statement.
+    ///
+    /// Return `None` if the step failed without an error of its own.
+    /// Such a step failed only because of a broken type, whose error was reported
+    /// where the type was written, so the block goes on: the broken type should not
+    /// hide the errors of the next steps.
+    fn analyze_step<T>(
+        &mut self,
+        analyze: impl FnOnce(&mut Self) -> Result<T, Failure>,
+    ) -> Result<Option<T>, Failure> {
+        let n_reported = self.diagnostics.len();
+        let failure = match analyze(self) {
+            Ok(result) => return Ok(Some(result)),
+            Err(failure) => failure,
+        };
+
+        self.report(failure);
+        if n_reported < self.diagnostics.len() {
+            return Err(Failure::Reported);
+        }
+        Ok(None)
+    }
+
     /// Analyze every item, even if some of them fail.
     ///
     /// Every error is reported as soon as it is found. If any item fails,
@@ -1420,8 +1451,9 @@ impl Scope {
         name: TemplateProgramWitness,
         ty: ResolvedType,
     ) -> Result<(), Error> {
-        // A use with a broken type says nothing reliable about the parameter,
-        // so the stored type never contains `!` and never changes once stored.
+        // A use with a broken type says nothing reliable about the parameter, so it is
+        // not stored, and the stored type never changes. Enum payloads are not searched,
+        // so a stored enum may carry `!`, but a program with errors is never built.
         if ty.contains_never() {
             return Ok(());
         }
@@ -1829,11 +1861,17 @@ impl AbstractSyntaxTree for Assignment {
         // However, the expression evaluated in the assignment does have a type,
         // namely the type specified in the assignment.
         let ty_expr = scope.resolve(from.ty()).with_span(from)?;
-        let expression = Expression::analyze(from.expression(), &ty_expr, scope)?;
-        let typed_variables = from.pattern().is_of_type(&ty_expr).with_span(from)?;
-        for (identifier, ty) in typed_variables {
-            scope.insert_variable(identifier, ty);
+        let expression = Expression::analyze(from.expression(), &ty_expr, scope);
+        // The variables are bound even if the expression failed, because the block goes on
+        // after a failure that only a broken type caused (see `Scope::analyze_step`).
+        let typed_variables = from.pattern().is_of_type(&ty_expr).with_span(from);
+        if let Ok(typed_variables) = &typed_variables {
+            for (identifier, ty) in typed_variables {
+                scope.insert_variable(identifier.clone(), ty.clone());
+            }
         }
+        let expression = expression?;
+        typed_variables?;
 
         Ok(Self {
             pattern: from.pattern().clone(),
@@ -1960,7 +1998,7 @@ fn analyze_enum_construction(
     })
 }
 
-/// Do `a` and `b` carry the same enum at every corresponding position?
+/// Can values of type `source` be cast as values of type `target`?
 ///
 /// Casts prove structural equality, but enums are nominal: a cast may
 /// freely reshape enum-free structure (`(u16, u16)` into `u32`), while
@@ -1972,6 +2010,12 @@ fn analyze_enum_construction(
 /// subtree (such as an array-to-tuple conversion) is rejected even when
 /// the enum itself is unchanged.
 ///
+/// The walk aligns the constructors of both types and checks each pair of parts once,
+/// so types that share their parts are not walked as trees. Where the shapes differ,
+/// the parts are compared by their structural types. `!` stands for a broken type
+/// whose error was reported already, so it may be cast to and from any type:
+/// a cast is rejected only if it is wrong whatever the broken parts stand for.
+///
 /// TODO(enums): this walk aligns high-level constructors, so casts that
 /// reshape only the container around an enum are rejected even when the
 /// enum keeps its structural position, e.g. `Option<E>` to
@@ -1979,30 +2023,60 @@ fn analyze_enum_construction(
 /// with nominal enum leaves — would accept those; keep `List` types
 /// conservative either way, since their partition layout complicates
 /// position alignment.
-fn cast_preserves_enum_identity(source: &ResolvedType, target: &ResolvedType) -> bool {
-    match (source.as_inner(), target.as_inner()) {
-        (TypeInner::Enum(src), TypeInner::Enum(dst)) => src == dst,
-        (TypeInner::Enum(_), _) | (_, TypeInner::Enum(_)) => false,
-        (TypeInner::Option(src), TypeInner::Option(dst)) => cast_preserves_enum_identity(src, dst),
-        (TypeInner::Either(src_l, src_r), TypeInner::Either(dst_l, dst_r)) => {
-            cast_preserves_enum_identity(src_l, dst_l) && cast_preserves_enum_identity(src_r, dst_r)
+fn cast_is_valid(source: &ResolvedType, target: &ResolvedType) -> bool {
+    // Each pair also says whether the structure of the parts must match.
+    // It need not for the elements of empty arrays and lists, which only keep their enums.
+    let mut seen = HashSet::new();
+    let mut stack = vec![(source, target, true)];
+
+    while let Some((src, dst, structural)) = stack.pop() {
+        let entry = (std::ptr::from_ref(src), std::ptr::from_ref(dst), structural);
+        if std::ptr::eq(src, dst) || !seen.insert(entry) {
+            continue;
         }
-        (TypeInner::Tuple(src), TypeInner::Tuple(dst)) if src.len() == dst.len() => src
-            .iter()
-            .zip(dst.iter())
-            .all(|(src_el, dst_el)| cast_preserves_enum_identity(src_el, dst_el)),
-        (TypeInner::Array(src, src_len), TypeInner::Array(dst, dst_len)) if src_len == dst_len => {
-            cast_preserves_enum_identity(src, dst)
+
+        match (src.as_inner(), dst.as_inner()) {
+            (TypeInner::Never, _) | (_, TypeInner::Never) => {}
+            (TypeInner::Enum(src_info), TypeInner::Enum(dst_info)) if src_info == dst_info => {}
+            (TypeInner::Enum(_), _) | (_, TypeInner::Enum(_)) => return false,
+            (TypeInner::Option(src), TypeInner::Option(dst)) => {
+                stack.push((src.as_ref(), dst.as_ref(), structural));
+            }
+            (TypeInner::Either(src_l, src_r), TypeInner::Either(dst_l, dst_r)) => {
+                stack.push((src_l.as_ref(), dst_l.as_ref(), structural));
+                stack.push((src_r.as_ref(), dst_r.as_ref(), structural));
+            }
+            // Copies of the same alias share their elements.
+            (TypeInner::Tuple(src), TypeInner::Tuple(dst)) if Arc::ptr_eq(src, dst) => {}
+            (TypeInner::Tuple(src), TypeInner::Tuple(dst)) if src.len() == dst.len() => {
+                for (src_el, dst_el) in src.iter().zip(dst.iter()) {
+                    stack.push((src_el.as_ref(), dst_el.as_ref(), structural));
+                }
+            }
+            (TypeInner::Array(src, src_len), TypeInner::Array(dst, dst_len))
+                if src_len == dst_len =>
+            {
+                stack.push((src.as_ref(), dst.as_ref(), structural && 0 < *src_len));
+            }
+            (TypeInner::List(src, src_bound), TypeInner::List(dst, dst_bound))
+                if src_bound == dst_bound =>
+            {
+                stack.push((
+                    src.as_ref(),
+                    dst.as_ref(),
+                    structural && 1 < src_bound.get(),
+                ));
+            }
+            // Differently shaped parts may convert freely as long as no
+            // enum is involved on either side.
+            _ if src.contains_enum() || dst.contains_enum() => return false,
+            _ if !structural || src.contains_never() || dst.contains_never() => {}
+            _ if StructuralType::from(src) != StructuralType::from(dst) => return false,
+            _ => {}
         }
-        (TypeInner::List(src, src_bound), TypeInner::List(dst, dst_bound))
-            if src_bound == dst_bound =>
-        {
-            cast_preserves_enum_identity(src, dst)
-        }
-        // Differently shaped subtrees may convert freely as long as no
-        // enum is involved on either side.
-        _ => !source.contains_enum() && !target.contains_enum(),
     }
+
+    true
 }
 
 /// The given string does not name a variant of the enum.
@@ -2035,34 +2109,62 @@ impl AbstractSyntaxTree for Expression {
                 })
             }
             parse::ExpressionInner::Block(statements, expression) => {
-                let (ast_statements, ast_expression) =
-                    scope.in_block(|scope| -> Result<_, Failure> {
-                        let ast_statements = statements
-                            .iter()
-                            .map(|s| Statement::analyze(s, &ResolvedType::unit(), scope))
-                            .collect::<Result<Arc<[Statement]>, Failure>>()?;
-                        let ast_expression = match expression {
-                            Some(expression) => Expression::analyze(expression, ty, scope)
-                                .map(Arc::new)
-                                .map(Some),
-                            None if ty.compatible(&ResolvedType::unit()) => Ok(None),
-                            None => Err(Error::ExpressionTypeMismatch {
-                                expected: ty.clone(),
-                                found: ResolvedType::unit(),
-                            })
-                            .with_span(from)
-                            .map_err(Failure::from),
-                        }?;
-                        Ok((ast_statements, ast_expression))
-                    })?;
+                let span = *from.as_ref();
+                let inner = scope.in_block(|scope| {
+                    analyze_block(statements, expression.as_deref(), ty, span, scope)
+                })?;
 
                 Ok(Self {
                     ty: ty.clone(),
-                    inner: ExpressionInner::Block(ast_statements, ast_expression),
-                    span: *from.as_ref(),
+                    inner,
+                    span,
                 })
             }
         }
+    }
+}
+
+/// Analyze the statements and the final expression of a block.
+///
+/// The block stops at the first step with an error of its own. A step that failed
+/// only because of a broken type does not stop it (see [`Scope::analyze_step`]),
+/// but the block fails at the end.
+fn analyze_block(
+    statements: &[parse::Statement],
+    expression: Option<&parse::Expression>,
+    ty: &ResolvedType,
+    span: Span,
+    scope: &mut Scope,
+) -> Result<ExpressionInner, Failure> {
+    let unit = ResolvedType::unit();
+    let mut ast_statements = Vec::with_capacity(statements.len());
+    let mut broken = false;
+    for statement in statements {
+        match scope.analyze_step(|scope| Statement::analyze(statement, &unit, scope))? {
+            Some(ast_statement) => ast_statements.push(ast_statement),
+            None => broken = true,
+        }
+    }
+
+    let ast_expression = scope.analyze_step(|scope| match expression {
+        Some(expression) => Expression::analyze(expression, ty, scope)
+            .map(Arc::new)
+            .map(Some),
+        None if ty.compatible(&unit) => Ok(None),
+        None => Err(Error::ExpressionTypeMismatch {
+            expected: ty.clone(),
+            found: unit.clone(),
+        })
+        .with_span(span)
+        .map_err(Failure::from),
+    })?;
+
+    match ast_expression {
+        Some(ast_expression) if !broken => Ok(ExpressionInner::Block(
+            Arc::from(ast_statements),
+            ast_expression,
+        )),
+        _ => Err(Failure::Reported),
     }
 }
 
@@ -2173,8 +2275,12 @@ impl AbstractSyntaxTree for SingleExpression {
                     .ok_or(Error::ExpressionUnexpectedType { ty: ty.clone() })
                     .with_span(from)?;
                 if tuple.len() != types.len() {
-                    return Err(Error::ExpressionUnexpectedType { ty: ty.clone() })
-                        .with_span(from)?;
+                    // The number of elements is wrong whatever the broken elements stand for.
+                    scope.report_definite(
+                        Error::ExpressionUnexpectedType { ty: ty.clone() }
+                            .with_span(*from.as_ref()),
+                    );
+                    return Err(Failure::Reported);
                 }
 
                 scope
@@ -2193,8 +2299,9 @@ impl AbstractSyntaxTree for SingleExpression {
 
                 // The element type is known even if the size is wrong,
                 // so the elements are analyzed either way.
+                // The size is wrong whatever the broken elements stand for.
                 if array.len() != size {
-                    scope.report(
+                    scope.report_definite(
                         Error::ExpressionUnexpectedType { ty: ty.clone() }
                             .with_span(*from.as_ref()),
                     );
@@ -2214,7 +2321,7 @@ impl AbstractSyntaxTree for SingleExpression {
                     .with_span(from)?;
 
                 if bound.get() <= list.len() {
-                    scope.report(
+                    scope.report_definite(
                         Error::ExpressionUnexpectedType { ty: ty.clone() }
                             .with_span(*from.as_ref()),
                     );
@@ -2299,7 +2406,15 @@ impl AbstractSyntaxTree for EnumMatch {
         let enum_ty = scope.get_alias(&alias).with_span(span)?;
         let info = match enum_ty.as_enum() {
             Some(info) => info.clone(),
-            None if enum_ty.is_never() => return Err(Failure::Reported),
+            None if enum_ty.is_never() => {
+                // The enum is broken, so its variants are unknown,
+                // but the scrutinee and the arms can still have errors of their own.
+                let _ = Expression::analyze(from.scrutinee(), &enum_ty, scope)
+                    .map_err(|failure| scope.report(failure));
+                let _ =
+                    scope.analyze_all(arms, |arm, scope| analyze_enum_arm(arm, None, ty, scope));
+                return Err(Failure::Reported);
+            }
             None => Err(Error::Grammar {
                 msg: format!(
                     "`{enum_name}` is not an enum, so match arms of the form \
@@ -2376,24 +2491,7 @@ impl AbstractSyntaxTree for EnumMatch {
         let arm_asts = scope
             .analyze_all(
                 covered.into_iter().zip(info.variants()),
-                |(arm, variant), scope| {
-                    let arm_span = *arm.span();
-                    let pattern = analyze_enum_arm_bindings(arm, variant, scope, arm_span)?;
-                    scope.in_match_arm(|scope| {
-                        let payload_ty = variant.payload_type();
-                        let typed_variables = pattern.is_of_type(payload_ty).with_span(arm_span)?;
-                        for (identifier, variable_ty) in typed_variables {
-                            scope.insert_variable(identifier, variable_ty);
-                        }
-                        let body =
-                            Expression::analyze(arm.expression(), ty, scope).map(Arc::new)?;
-                        Ok(EnumMatchArm {
-                            pattern,
-                            body,
-                            span: arm_span,
-                        })
-                    })
-                },
+                |(arm, variant), scope| analyze_enum_arm(arm, Some(variant), ty, scope),
             )
             .map(Arc::from)?;
 
@@ -2405,53 +2503,88 @@ impl AbstractSyntaxTree for EnumMatch {
     }
 }
 
+/// Analyze an arm of an enum match on the given variant,
+/// or on an unknown variant if the enum is broken.
+fn analyze_enum_arm(
+    arm: &parse::EnumMatchArm,
+    variant: Option<&EnumVariantInfo>,
+    ty: &ResolvedType,
+    scope: &mut Scope,
+) -> Result<EnumMatchArm, Failure> {
+    let span = *arm.span();
+    let (pattern, bindings_ty) = analyze_enum_arm_bindings(arm, variant, scope, span)?;
+    scope.in_match_arm(|scope| {
+        let typed_variables = pattern.is_of_type(&bindings_ty).with_span(span)?;
+        for (identifier, variable_ty) in typed_variables {
+            scope.insert_variable(identifier, variable_ty);
+        }
+        let body = Expression::analyze(arm.expression(), ty, scope).map(Arc::new)?;
+        Ok(EnumMatchArm {
+            pattern,
+            body,
+            span,
+        })
+    })
+}
+
 /// Check an enum match arm's payload bindings against the variant's declared
-/// payload types and combine them into one pattern for the variant's leaf.
+/// payload types and combine them into one pattern for the variant's leaf,
+/// with the type of the values that the pattern binds.
 ///
 /// Unit variants bind nothing ([`Pattern::Ignore`]); a single binding stands
 /// alone; multiple bindings form a tuple pattern, matching the tuple that a
 /// multi-payload variant carries at its leaf.
+///
+/// Like the variables of an assignment, the bindings take their written types,
+/// so a broken payload type does not hide the errors in the arm.
+/// Without a variant, the enum is broken and only the written types are resolved.
 fn analyze_enum_arm_bindings(
     arm: &parse::EnumMatchArm,
-    variant: &EnumVariantInfo,
+    variant: Option<&EnumVariantInfo>,
     scope: &Scope,
     span: Span,
-) -> Result<Pattern, Diagnostic> {
-    if arm.bindings().len() != variant.payload().len() {
-        return Err(Error::Grammar {
-            msg: format!(
-                "variant '{}' of enum '{}' carries {} payload value(s), \
-                 but the arm binds {}",
-                arm.variant(),
-                arm.enum_path_string(),
-                variant.payload().len(),
-                arm.bindings().len()
-            ),
-        })
-        .with_span(span);
-    }
-
-    let mut patterns = Vec::with_capacity(arm.bindings().len());
-    for ((pattern, declared), payload_ty) in arm.bindings().iter().zip(variant.payload()) {
-        let declared = scope.resolve(declared).with_span(span)?;
-
-        if !declared.compatible(payload_ty) {
-            return Err(Error::ExpressionTypeMismatch {
-                expected: payload_ty.clone(),
-                found: declared,
+) -> Result<(Pattern, ResolvedType), Diagnostic> {
+    if let Some(variant) = variant {
+        if arm.bindings().len() != variant.payload().len() {
+            return Err(Error::Grammar {
+                msg: format!(
+                    "variant '{}' of enum '{}' carries {} payload value(s), \
+                     but the arm binds {}",
+                    arm.variant(),
+                    arm.enum_path_string(),
+                    variant.payload().len(),
+                    arm.bindings().len()
+                ),
             })
             .with_span(span);
         }
-
-        patterns.push(pattern.clone());
     }
 
-    let pattern = match patterns.len() {
-        0 => Pattern::Ignore,
-        1 => patterns[0].clone(),
-        _ => Pattern::tuple(patterns),
+    let mut patterns = Vec::with_capacity(arm.bindings().len());
+    let mut types = Vec::with_capacity(arm.bindings().len());
+    for (index, (pattern, declared)) in arm.bindings().iter().enumerate() {
+        let declared = scope.resolve(declared).with_span(span)?;
+
+        if let Some(payload_ty) = variant.map(|variant| &variant.payload()[index]) {
+            if !declared.compatible(payload_ty) {
+                return Err(Error::ExpressionTypeMismatch {
+                    expected: payload_ty.clone(),
+                    found: declared,
+                })
+                .with_span(span);
+            }
+        }
+
+        patterns.push(pattern.clone());
+        types.push(declared);
+    }
+
+    let bindings = match patterns.len() {
+        0 => (Pattern::Ignore, ResolvedType::unit()),
+        1 => (patterns[0].clone(), types[0].clone()),
+        _ => (Pattern::tuple(patterns), ResolvedType::tuple(types)),
     };
-    Ok(pattern)
+    Ok(bindings)
 }
 
 impl AbstractSyntaxTree for Call {
@@ -2577,16 +2710,12 @@ impl AbstractSyntaxTree for Call {
             CallName::TypeCast(source) => {
                 // Casts prove structural equality, but enums are nominal:
                 // every enum must map to itself at its structural position
-                // (see `cast_preserves_enum_identity`), else same-shaped
+                // (see `cast_is_valid`), else same-shaped
                 // enums would convert variants by ordinal position.
-                // The nominal check comes first: it is cheap and safe with `!`,
-                // while lowering is neither.
-                if !cast_preserves_enum_identity(&source, ty)
-                    || (source.has_structural_type()
-                        && ty.has_structural_type()
-                        && StructuralType::from(&source) != StructuralType::from(ty))
-                {
-                    scope.report(
+                // A rejected cast is wrong whatever its broken parts stand for,
+                // so it is reported even if its types mention `!`.
+                if !cast_is_valid(&source, ty) {
+                    scope.report_definite(
                         Error::InvalidCast {
                             source: source.clone(),
                             target: ty.clone(),
@@ -2724,28 +2853,37 @@ impl CallName {
             parse::CallName::Unwrap => Ok(Self::Unwrap),
             parse::CallName::RawHash(tuple_ty) => {
                 let tuple_ty = scope.resolve(tuple_ty).with_span(from)?;
+                if tuple_ty.is_never() {
+                    return Err(Failure::Reported);
+                }
 
                 // Every element must be an integer with a `sha_256_ctx_8_add_N` jet.
-                let widths = tuple_ty
+                // Broken elements are skipped, so that the other elements are still checked.
+                let jets = tuple_ty
                     .as_tuple()
                     .and_then(|elements| {
                         elements
                             .iter()
+                            .filter(|element| !element.is_never())
                             .map(|element| element.as_integer())
                             .collect::<Option<Vec<UIntType>>>()
                     })
-                    .ok_or(Error::RawHashUnsupportedType {
-                        ty: tuple_ty.clone(),
-                    })
-                    .with_span(from)?;
+                    .map(|widths| RawHashJets::new(scope.jet_hinter.as_ref(), widths));
 
-                match RawHashJets::new(scope.jet_hinter.as_ref(), widths) {
-                    Ok(jets) => Ok(Self::RawHash(tuple_ty, jets)),
-                    Err(RawHashJetsError::UnsupportedWidth(_)) => {
-                        Err(Error::RawHashUnsupportedType { ty: tuple_ty }).with_span(from)
+                match jets {
+                    Some(Ok(jets)) if !tuple_ty.contains_never() => {
+                        Ok(Self::RawHash(tuple_ty, jets))
                     }
-                    Err(RawHashJetsError::Unavailable) => {
+                    // The jets for the broken elements are unknown.
+                    Some(Ok(_)) => return Err(Failure::Reported),
+                    Some(Err(RawHashJetsError::Unavailable)) => {
                         Err(Error::RawHashJetsUnavailable).with_span(from)
+                    }
+                    None | Some(Err(RawHashJetsError::UnsupportedWidth(_))) => {
+                        // The other elements are wrong whatever the broken ones stand for.
+                        let error = Error::RawHashUnsupportedType { ty: tuple_ty };
+                        scope.report_definite(error.with_span(*from.as_ref()));
+                        return Err(Failure::Reported);
                     }
                 }
             }
@@ -3029,7 +3167,7 @@ fn main() {
 
 #[cfg(test)]
 mod multi_error_tests {
-    use crate::test_utils::assert_errors;
+    use crate::test_utils::{analysis_errors, assert_errors};
 
     #[test]
     fn tuple_elements() {
@@ -3521,6 +3659,189 @@ mod multi_error_tests {
                 "Variable `x` is not defined",
                 "Variable `y` is not defined",
             ],
+        );
+    }
+
+    #[test]
+    fn value_of_broken_type_does_not_stop_the_block() {
+        assert_errors(
+            "type Alias = Missing;
+            fn main() {
+                let x: Alias = 5;
+                let y: u8 = x;
+                let z: u8 = w;
+            }",
+            &[
+                "Type alias `Missing` is not defined",
+                "Variable `w` is not defined",
+            ],
+        );
+    }
+
+    #[test]
+    fn own_error_still_stops_the_block() {
+        assert_errors(
+            "type Alias = Missing;
+            fn main() {
+                let x: Alias = y;
+                let z: u8 = w;
+            }",
+            &[
+                "Type alias `Missing` is not defined",
+                "Variable `y` is not defined",
+            ],
+        );
+    }
+
+    #[test]
+    fn match_on_broken_enum_still_reports_scrutinee_and_arms() {
+        assert_errors(
+            "type Bad = Missing;
+            fn f() -> u32 {
+                match e {
+                    Bad::A(a: u32) => { let b: bool = a; 0 },
+                    Bad::B => z,
+                }
+            }
+            fn main() {}",
+            &[
+                "Type alias `Missing` is not defined",
+                "Variable `e` is not defined",
+                "Expected expression of type `bool`, found type `u32`",
+                "Variable `z` is not defined",
+            ],
+        );
+    }
+
+    #[test]
+    fn enum_arm_bindings_take_their_written_types() {
+        assert_errors(
+            "enum E { A(Missing), B }
+            fn main() {
+                let e: E = E::B;
+                let n: u32 = match e {
+                    E::A(a: u32) => { let b: bool = a; 0 },
+                    E::B => 1,
+                };
+            }",
+            &[
+                "Type alias `Missing` is not defined",
+                "Expected expression of type `bool`, found type `u32`",
+            ],
+        );
+    }
+
+    #[test]
+    fn cast_with_broken_parts_still_checks_the_other_parts() {
+        assert_errors(
+            "type Alias = Missing;
+            enum E { A(Missing), B }
+            fn f(p: (E, u8)) -> (E, u16) { <(E, u8)>::into(p) }
+            fn g(p: (Alias, u8)) -> (u32, u16) { <(Alias, u8)>::into(p) }
+            fn main() {}",
+            &[
+                "Type alias `Missing` is not defined",
+                "Type alias `Missing` is not defined",
+                "Cannot cast values of type `(E, u8)` as values of type `(E, u16)`",
+                "Cannot cast values of type `(_, u8)` as values of type `(u32, u16)`",
+            ],
+        );
+    }
+
+    #[test]
+    fn errors_that_hold_whatever_broken_types_stand_for_are_reported() {
+        assert_errors(
+            "type Alias = Missing;
+            fn wrong_size() { let a: [Option<Alias>; 3] = [None, None]; }
+            fn wrong_arity() { let t: (Alias, u8) = (1, 2, 3); }
+            fn wrong_element(t: (Alias, bool)) -> u256 { raw_hash::<(Alias, bool)>(t) }
+            fn main() {}",
+            &[
+                "Type alias `Missing` is not defined",
+                "Expected expression of type `[Option<_>; 3]`; found something else",
+                "Expected expression of type `(_, u8)`; found something else",
+                "`raw_hash` expects a tuple of `u8`, `u16`, `u32`, `u64`, `u128` or `u256`, found `(_, bool)`",
+            ],
+        );
+    }
+
+    #[test]
+    fn cast_between_shared_types_is_fast() {
+        let source = shared_aliases("A", "u8", 64)
+            + &shared_aliases("B", "u8", 64)
+            + "type Bad = Missing;
+            fn same(a: A64) -> B64 { <A64>::into(a) }
+            fn broken(a: A64) -> Bad { <A64>::into(a) }
+            fn main() {}";
+
+        assert_errors(&source, &["Type alias `Missing` is not defined"]);
+    }
+
+    #[test]
+    fn cast_between_shared_types_of_different_shapes_is_fast() {
+        // The types are lowered, which needs their bit width to fit in a `usize`.
+        let source = shared_aliases("A", "u8", 40)
+            + "fn f(a: Either<(), A40>) -> Option<A40> { <Either<(), A40>>::into(a) }
+            fn main() {}";
+
+        assert_errors(&source, &[]);
+    }
+
+    #[test]
+    fn error_about_shared_type_is_fast() {
+        let source = shared_aliases("A", "u8", 64) + "fn main() { let x: A64 = 5; }";
+
+        let errors = analysis_errors(&source);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("Expected expression of type `(("));
+        assert!(errors[0].contains("..."));
+    }
+
+    #[test]
+    fn deep_alias_chain_does_not_overflow_the_stack() {
+        // The function keeps the deepest type alive after the aliases are dropped,
+        // so dropping it last would recurse through the whole chain.
+        let depth = 20_000;
+        let mut source = String::from("type A0 = u8;\n");
+        for i in 1..=depth {
+            source += &format!("type A{i} = (A{}, u8);\n", i - 1);
+        }
+        source += &format!("fn f(a: A{depth}) {{}}\nfn main() {{}}");
+
+        // The size of the main thread's stack, where the compiler usually runs.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || assert_errors(&source, &[]))
+            .expect("the thread starts")
+            .join()
+            .expect("analysis finishes without overflowing the stack");
+    }
+
+    /// Each use of a parameter must not walk its whole type,
+    /// or analysis takes time quadratic in the size of the program.
+    ///
+    /// Ignored because it measures time. Run it with
+    /// `cargo test repeated_uses_of_wide_parameter -- --ignored`.
+    #[test]
+    #[ignore = "measures time"]
+    fn repeated_uses_of_wide_parameter_scale_linearly() {
+        let analysis_time = |n: usize| {
+            let mut source = format!("type W = ({});\nfn main() {{\n", vec!["u8"; n].join(", "));
+            for i in 0..n {
+                source += &format!("let x{i}: W = param::X;\n");
+            }
+            source += "}";
+
+            let start = std::time::Instant::now();
+            assert_errors(&source, &[]);
+            start.elapsed().as_secs_f64()
+        };
+
+        // Linear analysis predicts a ratio of about 8, quadratic analysis about 64.
+        let ratio = analysis_time(8000) / analysis_time(1000);
+        assert!(
+            ratio < 20.0,
+            "8 times the uses took {ratio:.1} times as long"
         );
     }
 }

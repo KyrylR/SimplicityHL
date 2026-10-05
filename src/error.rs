@@ -1090,7 +1090,9 @@ impl fmt::Display for Error {
             ),
             Error::InvalidCast { source, target } => write!(
                 f,
-                "Cannot cast values of type `{source}` as values of type `{target}`"
+                "Cannot cast values of type `{}` as values of type `{}`",
+                source.in_message(),
+                target.in_message()
             ),
             Error::MissingCrateKeyword => write!(
                 f,
@@ -1154,11 +1156,14 @@ impl fmt::Display for Error {
             ),
             Error::ExpressionUnexpectedType { ty } => write!(
                 f,
-                "Expected expression of type `{ty}`; found something else"
+                "Expected expression of type `{}`; found something else",
+                ty.in_message()
             ),
             Error::ExpressionTypeMismatch { expected, found } => write!(
                 f,
-                "Expected expression of type `{expected}`, found type `{found}`"
+                "Expected expression of type `{}`, found type `{}`",
+                expected.in_message(),
+                found.in_message()
             ),
             Error::ExpressionNotConstant => write!(
                 f,
@@ -1202,7 +1207,9 @@ impl fmt::Display for Error {
             ),
             Error::WitnessTypeMismatch { name, declared, assigned } => write!(
                 f,
-                "Witness `{name}` was declared with type `{declared}` but its assigned value is of type `{assigned}`"
+                "Witness `{name}` was declared with type `{}` but its assigned value is of type `{}`",
+                declared.in_message(),
+                assigned.in_message()
             ),
             Error::WitnessReassigned { name } => write!(
                 f,
@@ -1230,7 +1237,9 @@ impl fmt::Display for Error {
             ),
             Error::ArgumentTypeMismatch { name, declared, assigned } => write!(
                 f,
-                "Parameter `{name}` was declared with type `{declared}` but its assigned argument is of type `{assigned}`"
+                "Parameter `{name}` was declared with type `{}` but its assigned argument is of type `{}`",
+                declared.in_message(),
+                assigned.in_message()
             ),
             Error::RawHashJetsUnavailable => write!(
                 f,
@@ -1238,7 +1247,8 @@ impl fmt::Display for Error {
             ),
             Error::RawHashUnsupportedType { ty } => write!(
                 f,
-                "`raw_hash` expects a tuple of `u8`, `u16`, `u32`, `u64`, `u128` or `u256`, found `{ty}`"
+                "`raw_hash` expects a tuple of `u8`, `u16`, `u32`, `u64`, `u128` or `u256`, found `{}`",
+                ty.in_message()
             ),
         }
     }
